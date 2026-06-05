@@ -1,0 +1,238 @@
+version: "3.9"
+
+services:
+  # ============================================================
+  # PostgreSQL — Primary Database
+  # ============================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: printer-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-printerdb}
+      POSTGRES_USER: ${POSTGRES_USER:-printer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_5432}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-printer}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - printer-net
+
+  # ============================================================
+  # Redis — Cache & Message Broker
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: printer-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - printer-net
+
+  # ============================================================
+  # Backend API — FastAPI
+  # ============================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: printer-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-printer}:${POSTGRES_PASSWORD:-changeme_5432}@postgres:5432/${POSTGRES_DB:-printerdb}"
+      REDIS_URL: "redis://redis:6379/0"
+      SECRET_KEY: ${SECRET_KEY:-super-secret-key-change-me}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-1440}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      MONITORING_SERVICE_URL: "http://monitoring-service:9000"
+      WEBSOCKET_INTERNAL_URL: "http://websocket:8888"
+      DISCOVERY_SERVICE_URL: "http://host.docker.internal:9001"
+      NOTIFICATION_SERVICE_URL: "http://notification-service:9002"
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - backend_reports:/app/reports
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - printer-net
+
+  # ============================================================
+  # WebSocket Server — realtime events
+  # ============================================================
+  websocket:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: printer-websocket
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-printer}:${POSTGRES_PASSWORD:-changeme_5432}@postgres:5432/${POSTGRES_DB:-printerdb}"
+      REDIS_URL: "redis://redis:6379/0"
+      SECRET_KEY: ${SECRET_KEY:-super-secret-key-change-me}
+    ports:
+      - "8888:8888"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.websocket_server:app --host 0.0.0.0 --port 8888
+    networks:
+      - printer-net
+
+  # ============================================================
+  # Monitoring Service — SNMP/Ping collector
+  # ============================================================
+  monitoring-service:
+    build:
+      context: ./monitoring
+      dockerfile: Dockerfile
+    container_name: printer-monitoring
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-printer}:${POSTGRES_PASSWORD:-changeme_5432}@postgres:5432/${POSTGRES_DB:-printerdb}"
+      REDIS_URL: "redis://redis:6379/1"
+      SNMP_COMMUNITY: ${SNMP_COMMUNITY:-public}
+      SNMP_RETRIES: ${SNMP_RETRIES:-2}
+      SNMP_TIMEOUT: ${SNMP_TIMEOUT:-3}
+      INTERVAL_SECONDS: ${MONITORING_INTERVAL_SECONDS:-60}
+      BACKEND_API_URL: "http://backend:8000"
+      NOTIFICATION_SERVICE_URL: "http://notification-service:9002"
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+    ports:
+      - "9000:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - printer-net
+
+  # ============================================================
+  # Discovery Service — Auto-discovery (SNMP/Nmap/Ping)
+  # ============================================================
+  discovery-service:
+    build:
+      context: ./discovery
+      dockerfile: Dockerfile
+    container_name: printer-discovery
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-printer}:${POSTGRES_PASSWORD:-changeme_5432}@127.0.0.1:5432/${POSTGRES_DB:-printerdb}"
+      REDIS_URL: "redis://127.0.0.1:6379/2"
+      SUBNETS: ${DISCOVERY_SUBNETS:-192.168.0.0/24,10.0.0.0/24}
+      DISCOVERY_METHOD: ${DISCOVERY_METHOD:-snmp_broadcast}
+      BACKEND_API_URL: "http://127.0.0.1:8000"
+      NOTIFICATION_SERVICE_URL: "http://127.0.0.1:9002"
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ============================================================
+  # Notification Service — Telegram bot
+  # ============================================================
+  notification-service:
+    build:
+      context: ./notification
+      dockerfile: Dockerfile
+    container_name: printer-notification
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-printer}:${POSTGRES_PASSWORD:-changeme_5432}@postgres:5432/${POSTGRES_DB:-printerdb}"
+      REDIS_URL: "redis://redis:6379/3"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:-237310013}
+      BACKEND_API_URL: "http://backend:8000/api/v1"
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN}
+      NOTIFICATION_THREADS: ${NOTIFICATION_THREADS:-4}
+    ports:
+      - "9002:9002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - printer-net
+
+  # ============================================================
+  # Frontend — React + Vite + MUI (built, served by nginx)
+  # ============================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api/v1}
+        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:8888}
+    container_name: printer-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+      - websocket
+    networks:
+      - printer-net
+
+  # ============================================================
+  # Nginx — Reverse Proxy
+  # ============================================================
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: printer-nginx
+    restart: unless-stopped
+    ports:
+      - "8081:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+      - frontend
+      - websocket
+    networks:
+      - printer-net
+
+volumes:
+  postgres_data:
+  redis_data:
+  backend_reports:
+
+networks:
+  printer-net:
+    driver: bridge
