@@ -14,6 +14,8 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
+🇷🇺 **Русский** · [🇬🇧 English](README.en.md)
+
 [Возможности](#-возможности) ·
 [Архитектура](#-архитектура) ·
 [Установка](#-установка-за-3-команды) ·
